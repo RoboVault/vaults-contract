@@ -2,9 +2,9 @@
 pragma solidity >=0.6.0 <0.7.0;
 pragma experimental ABIEncoderV2;
 
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
-import {SafeMath} from "@openzeppelin/contracts/math/SafeMath.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
+import "@openzeppelin/contracts/math/SafeMath.sol";
 
 struct StrategyParams {
     uint256 performanceFee;
@@ -159,6 +159,16 @@ interface StrategyAPI {
     event Harvested(uint256 profit, uint256 loss, uint256 debtPayment, uint256 debtOutstanding);
 }
 
+interface HealthCheck {
+    function check(
+        uint256 profit,
+        uint256 loss,
+        uint256 debtPayment,
+        uint256 debtOutstanding,
+        uint256 totalDebt
+    ) external view returns (bool);
+}
+
 /**
  * @title Yearn Base Strategy
  * @author yearn.finance
@@ -178,7 +188,12 @@ interface StrategyAPI {
 
 abstract contract BaseStrategy {
     using SafeMath for uint256;
+    using SafeERC20 for IERC20;
     string public metadataURI;
+
+    // health checks
+    bool public doHealthCheck;
+    address public healthCheck;
 
     /**
      * @notice
@@ -248,6 +263,9 @@ abstract contract BaseStrategy {
 
     event UpdatedMetadataURI(string metadataURI);
 
+    event SetHealthCheck(address);
+    event SetDoHealthCheck(bool);
+
     // The minimum number of seconds between harvest calls. See
     // `setMinReportDelay()` for more details.
     uint256 public minReportDelay;
@@ -268,30 +286,44 @@ abstract contract BaseStrategy {
     bool public emergencyExit;
 
     // modifiers
-    function _onlyAuthorized() internal {
-        require(msg.sender == strategist || msg.sender == governance());
+    modifier onlyAuthorized() {
+        require(msg.sender == strategist || msg.sender == governance(), "!authorized");
+        _;
     }
 
-    function _onlyEmergencyAuthorized() internal {
-        require(msg.sender == strategist || msg.sender == governance() || msg.sender == vault.guardian() || msg.sender == vault.management());
+    modifier onlyEmergencyAuthorized() {
+        require(
+            msg.sender == strategist || msg.sender == governance() || msg.sender == vault.guardian() || msg.sender == vault.management(),
+            "!authorized"
+        );
+        _;
     }
 
-    function _onlyStrategist() internal {
-        require(msg.sender == strategist);
+    modifier onlyStrategist() {
+        require(msg.sender == strategist, "!strategist");
+        _;
     }
 
-    function _onlyGovernance() internal {
-        require(msg.sender == governance());
+    modifier onlyGovernance() {
+        require(msg.sender == governance(), "!authorized");
+        _;
     }
 
-    function _onlyKeepers() internal {
+    modifier onlyKeepers() {
         require(
             msg.sender == keeper ||
                 msg.sender == strategist ||
                 msg.sender == governance() ||
                 msg.sender == vault.guardian() ||
-                msg.sender == vault.management()
+                msg.sender == vault.management(),
+            "!authorized"
         );
+        _;
+    }
+
+    modifier onlyVaultManagers() {
+        require(msg.sender == vault.management() || msg.sender == governance(), "!authorized");
+        _;
     }
 
     constructor(address _vault) public {
@@ -320,7 +352,7 @@ abstract contract BaseStrategy {
 
         vault = VaultAPI(_vault);
         want = IERC20(vault.token());
-        SafeERC20.safeApprove(want, _vault, uint256(-1)); // Give Vault unlimited access (might save gas)
+        want.safeApprove(_vault, uint256(-1)); // Give Vault unlimited access (might save gas)
         strategist = _strategist;
         rewards = _rewards;
         keeper = _keeper;
@@ -334,6 +366,16 @@ abstract contract BaseStrategy {
         vault.approve(rewards, uint256(-1)); // Allow rewards to be pulled
     }
 
+    function setHealthCheck(address _healthCheck) external onlyVaultManagers {
+        emit SetHealthCheck(_healthCheck);
+        healthCheck = _healthCheck;
+    }
+
+    function setDoHealthCheck(bool _doHealthCheck) external onlyVaultManagers {
+        emit SetDoHealthCheck(_doHealthCheck);
+        doHealthCheck = _doHealthCheck;
+    }
+
     /**
      * @notice
      *  Used to change `strategist`.
@@ -341,8 +383,7 @@ abstract contract BaseStrategy {
      *  This may only be called by governance or the existing strategist.
      * @param _strategist The new address to assign as `strategist`.
      */
-    function setStrategist(address _strategist) external {
-        _onlyAuthorized();
+    function setStrategist(address _strategist) external onlyAuthorized {
         require(_strategist != address(0));
         strategist = _strategist;
         emit UpdatedStrategist(_strategist);
@@ -361,8 +402,7 @@ abstract contract BaseStrategy {
      *  This may only be called by governance or the strategist.
      * @param _keeper The new address to assign as `keeper`.
      */
-    function setKeeper(address _keeper) external {
-        _onlyAuthorized();
+    function setKeeper(address _keeper) external onlyAuthorized {
         require(_keeper != address(0));
         keeper = _keeper;
         emit UpdatedKeeper(_keeper);
@@ -376,8 +416,7 @@ abstract contract BaseStrategy {
      *  This may only be called by the strategist.
      * @param _rewards The address to use for pulling rewards.
      */
-    function setRewards(address _rewards) external {
-        _onlyStrategist();
+    function setRewards(address _rewards) external onlyStrategist {
         require(_rewards != address(0));
         vault.approve(rewards, 0);
         rewards = _rewards;
@@ -397,8 +436,7 @@ abstract contract BaseStrategy {
      *  This may only be called by governance or the strategist.
      * @param _delay The minimum number of seconds to wait between harvests.
      */
-    function setMinReportDelay(uint256 _delay) external {
-        _onlyAuthorized();
+    function setMinReportDelay(uint256 _delay) external onlyAuthorized {
         minReportDelay = _delay;
         emit UpdatedMinReportDelay(_delay);
     }
@@ -415,8 +453,7 @@ abstract contract BaseStrategy {
      *  This may only be called by governance or the strategist.
      * @param _delay The maximum number of seconds to wait between harvests.
      */
-    function setMaxReportDelay(uint256 _delay) external {
-        _onlyAuthorized();
+    function setMaxReportDelay(uint256 _delay) external onlyAuthorized {
         maxReportDelay = _delay;
         emit UpdatedMaxReportDelay(_delay);
     }
@@ -431,8 +468,7 @@ abstract contract BaseStrategy {
      * @param _profitFactor A ratio to multiply anticipated
      * `harvest()` gas cost against.
      */
-    function setProfitFactor(uint256 _profitFactor) external {
-        _onlyAuthorized();
+    function setProfitFactor(uint256 _profitFactor) external onlyAuthorized {
         profitFactor = _profitFactor;
         emit UpdatedProfitFactor(_profitFactor);
     }
@@ -450,8 +486,7 @@ abstract contract BaseStrategy {
      * @param _debtThreshold How big of a loss this Strategy may carry without
      * being required to report to the Vault.
      */
-    function setDebtThreshold(uint256 _debtThreshold) external {
-        _onlyAuthorized();
+    function setDebtThreshold(uint256 _debtThreshold) external onlyAuthorized {
         debtThreshold = _debtThreshold;
         emit UpdatedDebtThreshold(_debtThreshold);
     }
@@ -464,8 +499,7 @@ abstract contract BaseStrategy {
      *  This may only be called by governance or the strategist.
      * @param _metadataURI The URI that describe the strategy.
      */
-    function setMetadataURI(string calldata _metadataURI) external {
-        _onlyAuthorized();
+    function setMetadataURI(string calldata _metadataURI) external onlyAuthorized {
         metadataURI = _metadataURI;
         emit UpdatedMetadataURI(_metadataURI);
     }
@@ -633,8 +667,7 @@ abstract contract BaseStrategy {
      *
      *  This may only be called by governance, the strategist, or the keeper.
      */
-    function tend() external {
-        _onlyKeepers();
+    function tend() external onlyKeepers {
         // Don't take profits with this call, but adjust for better gains
         adjustPosition(vault.debtOutstanding());
     }
@@ -721,8 +754,7 @@ abstract contract BaseStrategy {
      *  called to report to the Vault on the Strategy's position, especially if
      *  any losses have occurred.
      */
-    function harvest() external {
-        _onlyKeepers();
+    function harvest() external onlyKeepers {
         uint256 profit = 0;
         uint256 loss = 0;
         uint256 debtOutstanding = vault.debtOutstanding();
@@ -744,10 +776,19 @@ abstract contract BaseStrategy {
         // Allow Vault to take up to the "harvested" balance of this contract,
         // which is the amount it has earned since the last time it reported to
         // the Vault.
+        uint256 totalDebt = vault.strategies(address(this)).totalDebt;
         debtOutstanding = vault.report(profit, loss, debtPayment);
 
         // Check if free returns are left, and re-invest them
         adjustPosition(debtOutstanding);
+
+        // call healthCheck contract
+        if (doHealthCheck && healthCheck != address(0)) {
+            require(HealthCheck(healthCheck).check(profit, loss, debtPayment, debtOutstanding, totalDebt), "!healthcheck");
+        } else {
+            emit SetDoHealthCheck(true);
+            doHealthCheck = true;
+        }
 
         emit Harvested(profit, loss, debtPayment, debtOutstanding);
     }
@@ -766,7 +807,7 @@ abstract contract BaseStrategy {
         uint256 amountFreed;
         (amountFreed, _loss) = liquidatePosition(_amountNeeded);
         // Send it directly back (NOTE: Using `msg.sender` saves some gas here)
-        SafeERC20.safeTransfer(want, msg.sender, amountFreed);
+        want.safeTransfer(msg.sender, amountFreed);
         // NOTE: Reinvest anything leftover on next `tend`/`harvest`
     }
 
@@ -793,7 +834,7 @@ abstract contract BaseStrategy {
         require(msg.sender == address(vault));
         require(BaseStrategy(_newStrategy).vault() == vault);
         prepareMigration(_newStrategy);
-        SafeERC20.safeTransfer(want, _newStrategy, want.balanceOf(address(this)));
+        want.safeTransfer(_newStrategy, want.balanceOf(address(this)));
     }
 
     /**
@@ -806,8 +847,7 @@ abstract contract BaseStrategy {
      * @dev
      *  See `vault.setEmergencyShutdown()` and `harvest()` for further details.
      */
-    function setEmergencyExit() external {
-        _onlyEmergencyAuthorized();
+    function setEmergencyExit() external onlyEmergencyAuthorized {
         emergencyExit = true;
         vault.revokeStrategy();
 
@@ -851,15 +891,14 @@ abstract contract BaseStrategy {
      *  should be protected from sweeping in addition to `want`.
      * @param _token The token to transfer out of this vault.
      */
-    function sweep(address _token) external {
-        _onlyGovernance();
+    function sweep(address _token) external onlyGovernance {
         require(_token != address(want), "!want");
         require(_token != address(vault), "!shares");
 
         address[] memory _protectedTokens = protectedTokens();
         for (uint256 i; i < _protectedTokens.length; i++) require(_token != _protectedTokens[i], "!protected");
 
-        SafeERC20.safeTransfer(IERC20(_token), governance(), IERC20(_token).balanceOf(address(this)));
+        IERC20(_token).safeTransfer(governance(), IERC20(_token).balanceOf(address(this)));
     }
 }
 
